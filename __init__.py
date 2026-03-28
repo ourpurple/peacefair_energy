@@ -1,121 +1,130 @@
 import logging
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
 import os
 from datetime import timedelta
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.core import HomeAssistant
-from .const import(
-    DOMAIN,
-    COORDINATOR,
-    DEFAULT_SCAN_INTERVAL,
-    ENERGY_SENSOR,
-    UN_SUBDISCRIPT,
-    DEVICES,
-    PROTOCOLS,
-    STORAGE_PATH
-)
 
+import homeassistant.helpers.config_validation as cv
+import voluptuous as vol
 from homeassistant.const import (
-    CONF_PROTOCOL,
-    CONF_SCAN_INTERVAL,
+    ATTR_ENTITY_ID,
     CONF_HOST,
     CONF_PORT,
+    CONF_PROTOCOL,
+    CONF_SCAN_INTERVAL,
     CONF_SLAVE,
 )
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from homeassistant.components.sensor import SensorDeviceClass  # ✅ 新增正确导入
-
-from homeassistant.const import ATTR_ENTITY_ID
-
+from .const import (
+    COORDINATOR,
+    DEFAULT_SCAN_INTERVAL,
+    DEVICES,
+    DOMAIN,
+    ENERGY_SENSOR,
+    PROTOCOLS,
+    STORAGE_PATH,
+    UN_SUBDISCRIPT,
+)
 from .modbus import ModbusHub
 
 SERVICE_RESET_ENERGY = "reset_energy"
+PLATFORMS = ["sensor"]
 
-RESET_ENERGY_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_ENTITY_ID): cv.entity_id
-    }
-)
+RESET_ENERGY_SCHEMA = vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_id})
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def update_listener(hass, config_entry):
+async def update_listener(hass: HomeAssistant, config_entry):
     scan_interval = config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     coordinator = hass.data[config_entry.entry_id][COORDINATOR]
     coordinator.update_interval = timedelta(seconds=scan_interval)
 
 
+async def _async_handle_reset_energy(hass: HomeAssistant, service: ServiceCall) -> None:
+    entity_id = service.data[ATTR_ENTITY_ID]
+    energy_sensors = hass.data.get(DOMAIN, {}).get(ENERGY_SENSOR, [])
+    energy_sensor = next((sensor for sensor in energy_sensors if sensor.entity_id == entity_id), None)
+
+    if energy_sensor is None:
+        _LOGGER.warning("Energy sensor not found for reset service: %s", entity_id)
+        return
+
+    try:
+        energy_sensor.coordinator.reset_energy()
+        energy_sensor.reset()
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.error("Failed to reset energy for %s: %s", entity_id, err)
+
+
 async def async_setup(hass: HomeAssistant, hass_config: dict):
-    hass.data.setdefault(DOMAIN, {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data.setdefault(DEVICES, [])
+    domain_data.setdefault(ENERGY_SENSOR, [])
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RESET_ENERGY):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RESET_ENERGY,
+            _async_handle_reset_energy,
+            schema=RESET_ENERGY_SCHEMA,
+        )
+
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry):
     config = config_entry.data
     protocol = PROTOCOLS[config[CONF_PROTOCOL]]
-    _LOGGER.debug(f"protocol={protocol}")
     host = config[CONF_HOST]
     port = config[CONF_PORT]
     slave = config[CONF_SLAVE]
     scan_interval = config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-    if DEVICES not in hass.data[DOMAIN]:
-        hass.data[DOMAIN][DEVICES] = []
-    hass.data[DOMAIN][DEVICES].append(host)
-    if config_entry.entry_id not in hass.data:
-        hass.data[config_entry.entry_id] = {}
+
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    devices = domain_data.setdefault(DEVICES, [])
+    domain_data.setdefault(ENERGY_SENSOR, [])
+    if host not in devices:
+        devices.append(host)
+
+    entry_data = hass.data.setdefault(config_entry.entry_id, {})
     coordinator = PeacefairCoordinator(hass, protocol, host, port, slave, scan_interval)
-    hass.data[config_entry.entry_id][COORDINATOR] = coordinator
+    entry_data[COORDINATOR] = coordinator
+
     await coordinator.async_config_entry_first_refresh()
-    hass.async_create_task(hass.config_entries.async_forward_entry_setups(
-    config_entry, ["sensor"]))
-    hass.data[config_entry.entry_id][UN_SUBDISCRIPT] = config_entry.add_update_listener(update_listener)
-
-    def service_handle(service):
-        entity_id = service.data[ATTR_ENTITY_ID]
-        energy_sensor = next(
-            (sensor for sensor in hass.data[DOMAIN][ENERGY_SENSOR] if sensor.entity_id == entity_id),
-            None,
-        )
-        if energy_sensor is None:
-            return
-
-        if service.service == SERVICE_RESET_ENERGY:
-            coordinator = hass.data[config_entry.entry_id][COORDINATOR]
-            if coordinator is not None:
-                coordinator.reset_energy()
-                energy_sensor.reset()
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_RESET_ENERGY,
-        service_handle,
-        schema=RESET_ENERGY_SCHEMA,
-    )
+    await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    entry_data[UN_SUBDISCRIPT] = config_entry.add_update_listener(update_listener)
 
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, config_entry):
+    unload_ok = await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)
+    if not unload_ok:
+        return False
 
-    await hass.config_entries.async_forward_entry_unload(config_entry, "sensor")
+    entry_data = hass.data.get(config_entry.entry_id, {})
+    coordinator = entry_data.get(COORDINATOR)
 
+    domain_data = hass.data.get(DOMAIN, {})
+    devices = domain_data.get(DEVICES, [])
     host = config_entry.data[CONF_HOST]
-    host = host.replace(".", "_")
-    energy_sensor = next(
-        (sensor for sensor in hass.data[DOMAIN][ENERGY_SENSOR] if sensor.entity_id == f"{host}_{SensorDeviceClass.ENERGY.value}"),  # ✅ 修改这里
-        None,
-    )
-    if energy_sensor is not None:
-        hass.data[DOMAIN][ENERGY_SENSOR].remove(energy_sensor)
-    unsub = hass.data[config_entry.entry_id][UN_SUBDISCRIPT]
+    if host in devices:
+        devices.remove(host)
+
+    energy_sensors = domain_data.get(ENERGY_SENSOR, [])
+    if coordinator is not None and energy_sensors:
+        domain_data[ENERGY_SENSOR] = [
+            sensor for sensor in energy_sensors if getattr(sensor, "coordinator", None) is not coordinator
+        ]
+
+    unsub = entry_data.get(UN_SUBDISCRIPT)
     if unsub is not None:
         unsub()
-    hass.data.pop(config_entry.entry_id)
-    storage_path = hass.config.path(f"{STORAGE_PATH}")
+
+    hass.data.pop(config_entry.entry_id, None)
+
+    storage_path = hass.config.path(STORAGE_PATH)
     record_file = hass.config.path(f"{STORAGE_PATH}/{config_entry.entry_id}_state.json")
     reset_file = hass.config.path(f"{STORAGE_PATH}/{config_entry.entry_id}_reset.json")
     if os.path.exists(record_file):
@@ -124,6 +133,10 @@ async def async_unload_entry(hass: HomeAssistant, config_entry):
         os.remove(reset_file)
     if os.path.exists(storage_path) and len(os.listdir(storage_path)) == 0:
         os.rmdir(storage_path)
+
+    if not domain_data.get(DEVICES):
+        hass.services.async_remove(DOMAIN, SERVICE_RESET_ENERGY)
+
     return True
 
 
@@ -133,10 +146,9 @@ class PeacefairCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=scan_interval)
+            update_interval=timedelta(seconds=scan_interval),
         )
         self._updates = None
-        self._hass = hass
         self._host = host
         self._hub = ModbusHub(protocol, host, port, slave)
 
@@ -146,7 +158,8 @@ class PeacefairCoordinator(DataUpdateCoordinator):
 
     def reset_energy(self):
         self._hub.reset_energy()
-        self.data[SensorDeviceClass.ENERGY.value] = 0.0  # ✅ 修改这里
+        if self.data is not None:
+            self.data["energy"] = 0.0
 
     def set_update(self, update):
         self._updates = update
@@ -156,7 +169,7 @@ class PeacefairCoordinator(DataUpdateCoordinator):
         data_update = self._hub.info_gather()
         if len(data_update) > 0:
             data = data_update
-            _LOGGER.debug(f"Got Data {data}")
+            _LOGGER.debug("Got Data %s", data)
             if self._updates is not None:
                 self._updates()
         return data

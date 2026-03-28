@@ -133,7 +133,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     for sensor_type in HPG_SENSORS.keys():
         sensor = HPGSensor(coordinator, config_entry.entry_id, sensor_type, ident, updates, last_reset)
         sensors.append(sensor)
-        if sensor.device_class == sensor_type:
+        if sensor_type == DEVICE_CLASS_ENERGY:
             if ENERGY_SENSOR not in hass.data[DOMAIN]:
                 hass.data[DOMAIN][ENERGY_SENSOR] = []
             hass.data[DOMAIN][ENERGY_SENSOR].append(sensor)
