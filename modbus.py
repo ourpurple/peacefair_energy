@@ -81,31 +81,64 @@ class ModbusResetEnergyRequest(ModbusRequest):
 class ModbusHub:
     def __init__(self, protocol, host, port, slave):
         self._lock = threading.Lock()
+        self._protocol = protocol
+        self._host = host
+        self._port = port
         self._slave = slave
-        
-        _LOGGER.debug(f"初始化 ModbusHub: 协议={protocol}, 主机={host}, 端口={port}, 从站={slave}")
-        
-        # 创建客户端
-        if protocol == "rtuovertcp":
-            self._client = ModbusTcpClient(
-                host=host,
-                port=port,
+        self._timeout = 2
+        self._last_error_log = 0.0
+        self._error_log_interval = 60.0
+
+        _LOGGER.debug(
+            f"Initialize ModbusHub: protocol={protocol}, host={host}, port={port}, slave={slave}"
+        )
+        self._client = self._create_client()
+
+    def _create_client(self):
+        if self._protocol == "rtuovertcp":
+            return ModbusTcpClient(
+                host=self._host,
+                port=self._port,
                 framer=_MODBUS_RTU_FRAMER,
-                timeout=2
+                timeout=self._timeout,
             )
-        elif protocol == "rtuoverudp":
-            self._client = ModbusUdpClient(
-                host=host,
-                port=port,
+        if self._protocol == "rtuoverudp":
+            return ModbusUdpClient(
+                host=self._host,
+                port=self._port,
                 framer=_MODBUS_RTU_FRAMER,
-                timeout=2
+                timeout=self._timeout,
             )
+        raise ValueError(f"Unsupported protocol: {self._protocol}")
+
+    def _is_connected(self):
+        return bool(getattr(self._client, "connected", False))
+
+    def _ensure_connected(self):
+        if self._is_connected():
+            return True
+        return bool(self._client.connect())
+
+    def _recreate_client(self):
+        try:
+            self._client.close()
+        except Exception:
+            pass
+        self._client = self._create_client()
+
+    def _log_connection_issue(self, level, message, exc):
+        import time
+
+        now = time.monotonic()
+        if now - self._last_error_log >= self._error_log_interval:
+            _LOGGER.log(level, "%s: %s", message, exc)
+            self._last_error_log = now
         else:
-            raise ValueError(f"不支持的协议: {protocol}")
-            
+            _LOGGER.debug("%s: %s", message, exc)
+
     def connect(self):
         with self._lock:
-            self._client.connect()
+            return self._ensure_connected()
 
     def close(self):
         with self._lock:
@@ -114,86 +147,127 @@ class ModbusHub:
     def read_holding_register(self):
         pass
 
-    def read_input_registers(self, address, count):
-        """读取输入寄存器 - 根据方法签名使用关键字参数"""
-        with self._lock:
-            try:
-                # 根据方法签名: (address: 'int', *, count: 'int' = 1, device_id: 'int' = 1, no_response_expected: 'bool' = False)
-                # 使用关键字参数调用
-                _LOGGER.debug(f"调用 read_input_registers(address={address}, count={count}, device_id={self._slave})")
-                return self._client.read_input_registers(
-                    address=address,
-                    count=count,
-                    device_id=self._slave
-                )
-            except TypeError as e:
-                # 如果 device_id 参数不被接受，尝试其他参数名
-                error_msg = str(e)
-                if "unexpected keyword argument 'device_id'" in error_msg:
+    def _read_input_registers_once(self, address, count):
+        try:
+            _LOGGER.debug(
+                "Call read_input_registers(address=%s, count=%s, device_id=%s)",
+                address,
+                count,
+                self._slave,
+            )
+            return self._client.read_input_registers(
+                address=address,
+                count=count,
+                device_id=self._slave,
+            )
+        except TypeError as e:
+            error_msg = str(e)
+            if "unexpected keyword argument 'device_id'" in error_msg:
+                try:
+                    _LOGGER.debug(
+                        "Fallback unit arg: read_input_registers(address=%s, count=%s, unit=%s)",
+                        address,
+                        count,
+                        self._slave,
+                    )
+                    return self._client.read_input_registers(
+                        address=address,
+                        count=count,
+                        unit=self._slave,
+                    )
+                except TypeError:
                     try:
-                        # 尝试使用 unit 参数名
-                        _LOGGER.debug(f"尝试使用 unit 参数: read_input_registers(address={address}, count={count}, unit={self._slave})")
+                        _LOGGER.debug(
+                            "Fallback slave arg: read_input_registers(address=%s, count=%s, slave=%s)",
+                            address,
+                            count,
+                            self._slave,
+                        )
                         return self._client.read_input_registers(
                             address=address,
                             count=count,
-                            unit=self._slave
+                            slave=self._slave,
                         )
-                    except TypeError as e2:
-                        try:
-                            # 尝试使用 slave 参数名
-                            _LOGGER.debug(f"尝试使用 slave 参数: read_input_registers(address={address}, count={count}, slave={self._slave})")
-                            return self._client.read_input_registers(
-                                address=address,
-                                count=count,
-                                slave=self._slave
-                            )
-                        except TypeError as e3:
-                            # 最后尝试只传递 address 和 count
-                            _LOGGER.debug(f"尝试仅传递 address 和 count: read_input_registers({address}, {count})")
-                            return self._client.read_input_registers(
-                                address,
-                                count
-                            )
-                else:
-                    _LOGGER.error(f"读取寄存器失败: {e}")
-                    raise
+                    except TypeError:
+                        _LOGGER.debug(
+                            "Fallback positional args: read_input_registers(%s, %s)",
+                            address,
+                            count,
+                        )
+                        return self._client.read_input_registers(address, count)
+            raise
+
+    def read_input_registers(self, address, count):
+        with self._lock:
+            try:
+                if not self._ensure_connected():
+                    _LOGGER.debug("Unable to connect to %s:%s before read", self._host, self._port)
+                    return None
+                return self._read_input_registers_once(address, count)
+            except Exception as first_error:
+                self._log_connection_issue(
+                    logging.DEBUG,
+                    f"Read failed, reconnecting {self._host}:{self._port}",
+                    first_error,
+                )
+                try:
+                    self._recreate_client()
+                    if not self._ensure_connected():
+                        _LOGGER.debug("Reconnect failed to %s:%s", self._host, self._port)
+                        return None
+                    return self._read_input_registers_once(address, count)
+                except Exception as second_error:
+                    self._log_connection_issue(
+                        logging.WARNING,
+                        f"Read retry failed {self._host}:{self._port}",
+                        second_error,
+                    )
+                    return None
 
     def reset_energy(self):
-        """重置电能计数"""
+        """Reset energy counter on the device."""
         with self._lock:
-            # 创建自定义请求
             request = ModbusResetEnergyRequest()
-            
-            # 执行请求
             try:
+                if not self._ensure_connected():
+                    raise ConnectionError(f"Unable to connect to {self._host}:{self._port}")
                 return self._client.execute(request)
-            except Exception as e:
-                _LOGGER.error(f"执行重置命令失败: {e}")
-                raise
+            except Exception as first_error:
+                self._log_connection_issue(
+                    logging.WARNING,
+                    f"Reset command failed, reconnecting {self._host}:{self._port}",
+                    first_error,
+                )
+                self._recreate_client()
+                if not self._ensure_connected():
+                    raise ConnectionError(f"Reconnect failed to {self._host}:{self._port}")
+                return self._client.execute(request)
 
     def info_gather(self):
         data = {}
-        try:
-            result = self.read_input_registers(0, 9)
-            if result is not None and not isinstance(result, ModbusIOException) \
-                    and hasattr(result, 'registers') and result.registers is not None and len(result.registers) == 9:
-                data[DEVICE_CLASS_VOLTAGE] = result.registers[0] / 10
-                data[DEVICE_CLASS_CURRENT] = ((result.registers[2] << 16) + result.registers[1]) / 1000
-                data[DEVICE_CLASS_POWER] = ((result.registers[4] << 16) + result.registers[3]) / 10
-                data[DEVICE_CLASS_ENERGY] = ((result.registers[6] << 16) + result.registers[5]) / 1000
-                data[DEVICE_CLASS_FREQUENCY] = result.registers[7] / 10
-                data[DEVICE_CLASS_POWER_FACTOR] = result.registers[8] / 100
-                _LOGGER.debug(f"成功读取数据: {data}")
-                return data
-            else:
-                if result is None:
-                    _LOGGER.debug(f"读取数据失败: 结果为 None")
-                elif isinstance(result, ModbusIOException):
-                    _LOGGER.debug(f"读取数据失败: ModbusIOException")
-                else:
-                    reg_len = len(result.registers) if hasattr(result, 'registers') and result.registers else 0
-                    _LOGGER.debug(f"读取数据失败: 寄存器数据不完整，长度: {reg_len}")
-                return data
-        except Exception as e:
-            _LOGGER.error(f"收集数据时出错: {e}")
+        result = self.read_input_registers(0, 9)
+        if result is None:
             return data
+
+        if isinstance(result, ModbusIOException):
+            _LOGGER.debug("Read failed with ModbusIOException")
+            return data
+
+        if hasattr(result, "isError") and result.isError():
+            _LOGGER.debug("Read failed with Modbus error response: %s", result)
+            return data
+
+        registers = getattr(result, "registers", None)
+        if registers is None or len(registers) != 9:
+            reg_len = len(registers) if registers is not None else 0
+            _LOGGER.debug("Read failed with invalid register length: %s", reg_len)
+            return data
+
+        data[DEVICE_CLASS_VOLTAGE] = registers[0] / 10
+        data[DEVICE_CLASS_CURRENT] = ((registers[2] << 16) + registers[1]) / 1000
+        data[DEVICE_CLASS_POWER] = ((registers[4] << 16) + registers[3]) / 10
+        data[DEVICE_CLASS_ENERGY] = ((registers[6] << 16) + registers[5]) / 1000
+        data[DEVICE_CLASS_FREQUENCY] = registers[7] / 10
+        data[DEVICE_CLASS_POWER_FACTOR] = registers[8] / 100
+        _LOGGER.debug("Read success: %s", data)
+        return data

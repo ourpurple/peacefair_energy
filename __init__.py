@@ -110,19 +110,19 @@ async def async_unload_entry(hass: HomeAssistant, config_entry):
         None,
     )
     if energy_sensor is not None:
-        hass.data[DOMAIN][ENERGY_SENSOR].pop(energy_sensor)
+        hass.data[DOMAIN][ENERGY_SENSOR].remove(energy_sensor)
     unsub = hass.data[config_entry.entry_id][UN_SUBDISCRIPT]
     if unsub is not None:
         unsub()
     hass.data.pop(config_entry.entry_id)
     storage_path = hass.config.path(f"{STORAGE_PATH}")
     record_file = hass.config.path(f"{STORAGE_PATH}/{config_entry.entry_id}_state.json")
-    reset_file = hass.config.path(f"{STORAGE_PATH}/{DOMAIN}_reset.json")
+    reset_file = hass.config.path(f"{STORAGE_PATH}/{config_entry.entry_id}_reset.json")
     if os.path.exists(record_file):
         os.remove(record_file)
     if os.path.exists(reset_file):
         os.remove(reset_file)
-    if len(os.listdir(storage_path)) == 0:
+    if os.path.exists(storage_path) and len(os.listdir(storage_path)) == 0:
         os.rmdir(storage_path)
     return True
 
